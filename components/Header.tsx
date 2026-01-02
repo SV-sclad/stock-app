@@ -17,7 +17,7 @@ const Header = async () => {
                 <nav className="hidden sm:block">
                     <NavItems />
                 </nav>
-                <UserDropdown />
+                 <UserDropdown />
 
                 
             </div>
