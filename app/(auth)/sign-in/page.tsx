@@ -65,6 +65,7 @@ const SignIn = () => {
 
                 <FooterLink text="Don't have an account?" linkText="Create an account" href="/sign-up" />
             </form>
+            
         </>
     );
 };
