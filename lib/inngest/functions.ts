@@ -1,120 +1,154 @@
-import {inngest} from "@/lib/inngest/client";
-import {NEWS_SUMMARY_EMAIL_PROMPT, PERSONALIZED_WELCOME_EMAIL_PROMPT} from "@/lib/inngest/prompts";
-import {sendNewsSummaryEmail, sendWelcomeEmail} from "@/lib/nodemailer";
-import {getAllUsersForNewsEmail} from "@/lib/actions/user.actions";
+import { getAllUsersForNewsEmail } from "@/lib/actions/user.actions";
 import { getWatchlistSymbolsByEmail } from "@/lib/actions/watchlist.actions";
 import { getNews } from "@/lib/actions/finnhub.actions";
 import { getFormattedTodayDate } from "@/lib/utils";
+import { Resend } from "resend";
 
-export const sendSignUpEmail = inngest.createFunction(
-    { id: 'sign-up-email' },
-    { event: 'app/user.created'},
-    async ({ event, step }) => {
-        const userProfile = `
-            - Country: ${event.data.country}
-            - Investment goals: ${event.data.investmentGoals}
-            - Risk tolerance: ${event.data.riskTolerance}
-            - Preferred industry: ${event.data.preferredIndustry}
-        `
+type UserForNewsEmail = {
+  id: string;
+  email: string;
+  name?: string;
+};
 
-        const prompt = PERSONALIZED_WELCOME_EMAIL_PROMPT.replace('{{userProfile}}', userProfile)
+type MarketNewsArticle = {
+  title: string;
+  url: string;
+  source?: string;
+  summary?: string;
+};
 
-        const response = await step.ai.infer('generate-welcome-intro', {
-            model: step.ai.models.gemini({ model: 'gemini-2.5-flash-lite' }),
-            body: {
-                contents: [
-                    {
-                        role: 'user',
-                        parts: [
-                            { text: prompt }
-                        ]
-                    }]
-            }
-        })
+export interface MarketNewsArticle2 {
+  title: string;
+  url: string;
+  source?: string;
+  summary?: string;
+  publishedAt?: string;
+}
 
-        await step.run('send-welcome-email', async () => {
-            const part = response.candidates?.[0]?.content?.parts?.[0];
-            const introText = (part && 'text' in part ? part.text : null) ||'Thanks for joining Signalist. You now have the tools to track markets and make smarter moves.'
+const resend = new Resend(process.env.RESEND_API_KEY);
 
-            const { data: { email, name } } = event;
+type SendWelcomeEmailParams = {
+  email: string;
+  name?: string;
+  country?: string;
+  investmentGoals?: string;
+  riskTolerance?: string;
+  preferredIndustry?: string;
+};
 
-            return await sendWelcomeEmail({ email, name, intro: introText });
-        })
+export const sendWelcomeEmail = async ({
+  email,
+  name,
+  country,
+  investmentGoals,
+  riskTolerance,
+  preferredIndustry,
+}: SendWelcomeEmailParams) => {
+  const userProfile = `
+- Country: ${country || "N/A"}
+- Investment goals: ${investmentGoals || "N/A"}
+- Risk tolerance: ${riskTolerance || "N/A"}
+- Preferred industry: ${preferredIndustry || "N/A"}
+`;
 
-        return {
-            success: true,
-            message: 'Welcome email sent successfully'
+  // Можно подставить любой текст приветствия
+  const introText = `Thanks for joining Signalist. Here’s your profile summary:\n${userProfile}`;
+
+  await resend.emails.send({
+    from: "onboarding@resend.dev", // 👈 твой домен
+    to: email,
+    subject: "Добро пожаловать в Signalist 🚀",
+    html: `
+      <h2>Привет${name ? `, ${name}` : ""}!</h2>
+      <p>${introText}</p>
+      <p>Рады видеть тебя в Signalist.</p>
+    `,
+  });
+
+  console.log(`Welcome email sent to ${email}`);
+};
+
+export async function sendDailyNewsSummary() {
+  try {
+    // 1️⃣ Получаем всех пользователей для рассылки
+    const users: UserForNewsEmail[] = await getAllUsersForNewsEmail();
+    if (!users || users.length === 0)
+      return { success: false, message: "No users found for news email" };
+
+    // 2️⃣ Собираем новости для каждого пользователя
+    const userNewsSummaries: {
+      user: UserForNewsEmail;
+      articles: MarketNewsArticle[];
+    }[] = [];
+
+    for (const user of users) {
+      try {
+        const symbols = await getWatchlistSymbolsByEmail(user.email);
+        let articlesRaw = await getNews(symbols);
+
+        // Если новостей нет, получаем общие
+        if (!articlesRaw || articlesRaw.length === 0) {
+          articlesRaw = await getNews();
         }
+
+        // Ограничиваем до 6 статей
+        articlesRaw = (articlesRaw || []).slice(0, 6);
+
+        // Приводим к типу MarketNewsArticle
+        const articles: MarketNewsArticle[] = articlesRaw.map((a) => ({
+          title: a.headline || "No title", // <-- заменяем на ключ, который реально приходит
+          url: a.url || "",
+          source: a.source,
+          summary: a.summary,
+          publishedAt: a.datetime, // <-- заменяем на ключ из API
+        }));
+
+        userNewsSummaries.push({ user, articles });
+      } catch (err) {
+        console.error("Error fetching news for user:", user.email, err);
+        userNewsSummaries.push({ user, articles: [] });
+      }
     }
-)
 
-export const sendDailyNewsSummary = inngest.createFunction(
-    { id: 'daily-news-summary' },
-    [ { event: 'app/send.daily.news' }, { cron: '0 12 * * *' } ],
-    async ({ step }) => {
-        // Step #1: Get all users for news delivery
-        const users = await step.run('get-all-users', getAllUsersForNewsEmail)
+    // 3️⃣ Отправка писем через Resend
+    await Promise.all(
+      userNewsSummaries.map(async ({ user, articles }) => {
+        if (!articles || articles.length === 0) return;
 
-        if(!users || users.length === 0) return { success: false, message: 'No users found for news email' };
+        const newsHtml = articles
+          .map(
+            (a) =>
+              `<p><strong>${a.title}</strong> (${a.source || "unknown"})<br/><a href="${a.url}">${a.url}</a><br/>${a.summary || ""}</p>`,
+          )
+          .join("");
 
-        // Step #2: For each user, get watchlist symbols -> fetch news (fallback to general)
-        const results = await step.run('fetch-user-news', async () => {
-            const perUser: Array<{ user: UserForNewsEmail; articles: MarketNewsArticle[] }> = [];
-            for (const user of users as UserForNewsEmail[]) {
-                try {
-                    const symbols = await getWatchlistSymbolsByEmail(user.email);
-                    let articles = await getNews(symbols);
-                    // Enforce max 6 articles per user
-                    articles = (articles || []).slice(0, 6);
-                    // If still empty, fallback to general
-                    if (!articles || articles.length === 0) {
-                        articles = await getNews();
-                        articles = (articles || []).slice(0, 6);
-                    }
-                    perUser.push({ user, articles });
-                } catch (e) {
-                    console.error('daily-news: error preparing user news', user.email, e);
-                    perUser.push({ user, articles: [] });
-                }
-            }
-            return perUser;
+        console.log(
+          `📧 Sending news summary to: ${user.email}, articles: ${articles.length}`,
+        );
+
+        await resend.emails.send({
+          from: "onboarding@resend.dev",
+          to: user.email,
+          subject: `Market News Summary — ${getFormattedTodayDate()}`,
+          html: `
+            <h2>Здравствуйте${user.name ? `, ${user.name}` : ""}!</h2>
+            <p>Вот краткая сводка новостей рынка за ${getFormattedTodayDate()}:</p>
+            ${newsHtml}
+            <hr />
+            <p style="font-size:12px;color:#888;">
+              Вы получили это письмо, потому что подписаны на рассылку Signalist.
+            </p>
+          `,
         });
+      }),
+    );
 
-        // Step #3: (placeholder) Summarize news via AI
-        const userNewsSummaries: { user: UserForNewsEmail; newsContent: string | null }[] = [];
-
-        for (const { user, articles } of results) {
-                try {
-                    const prompt = NEWS_SUMMARY_EMAIL_PROMPT.replace('{{newsData}}', JSON.stringify(articles, null, 2));
-
-                    const response = await step.ai.infer(`summarize-news-${user.email}`, {
-                        model: step.ai.models.gemini({ model: 'gemini-2.5-flash-lite' }),
-                        body: {
-                            contents: [{ role: 'user', parts: [{ text:prompt }]}]
-                        }
-                    });
-
-                    const part = response.candidates?.[0]?.content?.parts?.[0];
-                    const newsContent = (part && 'text' in part ? part.text : null) || 'No market news.'
-
-                    userNewsSummaries.push({ user, newsContent });
-                } catch (e) {
-                    console.error('Failed to summarize news for : ', user.email);
-                    userNewsSummaries.push({ user, newsContent: null });
-                }
-            }
-
-        // Step #4: (placeholder) Send the emails
-        await step.run('send-news-emails', async () => {
-                await Promise.all(
-                    userNewsSummaries.map(async ({ user, newsContent}) => {
-                        if(!newsContent) return false;
-
-                        return await sendNewsSummaryEmail({ email: user.email, date: getFormattedTodayDate(), newsContent })
-                    })
-                )
-            })
-
-        return { success: true, message: 'Daily news summary emails sent successfully' }
-    }
-)
+    return {
+      success: true,
+      message: "Daily news summary emails sent successfully",
+    };
+  } catch (err) {
+    console.error("sendDailyNewsSummary error:", err);
+    return { success: false, message: "Failed to send daily news summary" };
+  }
+}
